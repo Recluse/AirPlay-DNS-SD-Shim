@@ -31,17 +31,26 @@ link-local one, which is the direct-cable case link-local mDNS exists for. Pass
 `0` (or `kDNSServiceInterfaceIndexAny`) and it picks an address itself, as
 before, preferring real Ethernet/Wi-Fi over VMware/VirtualBox/WireGuard/Hyper-V
 adapters and skipping link-local. A **non-zero** index with no usable IPv4 —
-adapter unplugged, gone, or IPv6-only — is refused with `-65540`
+adapter down, gone, IPv6-only, or its address still `Tentative`/`Duplicate` — is
+refused with `-65540`
 (`kDNSServiceErr_BadParam`; the shim's own macro for it is misnamed
 `KDNSSERVICEERR_INVALID`) and a log line, rather than silently falling back to
 the guess: a caller that named an adapter has pinned its sockets to it, and
 advertising a different one announces the service where it isn't listening. In
 Bonjour-proxy mode the index is passed straight to Apple's `dnssd.dll`.
 
+Registration is refused the same way — `-65537` (`kDNSServiceErr_Unknown`) — when
+the mDNS socket cannot be opened on that address or cannot be scoped to it
+(`IP_MULTICAST_IF`, which on Windows and not the `bind` is what picks the
+outgoing interface). The socket is therefore opened *before* `DNSServiceRegister`
+returns, not on the responder thread: callers pass `callBack = NULL`, so a
+failure found later has no way back to them, and "accepted an address, failed to
+bind, reported success" is exactly the outcome the refusal exists to prevent.
+
 Note the index is a lossy identifier: an adapter may carry several IPv4
-addresses and the first is used. dns_sd gives the caller no way to name an
-address, so on a multi-address adapter the advertised A record can be a sibling
-of the address the caller's sockets bound to.
+addresses and the first usable one is used. dns_sd gives the caller no way to
+name an address, so on a multi-address adapter the advertised A record can be a
+sibling of the address the caller's sockets bound to.
 
 ## Build
 
@@ -54,7 +63,7 @@ Single translation unit + the vendored `mdns.h` header — no external deps.
 ## Which build is this?
 
 The version is compiled in. On its **first registration** the shim announces
-itself on stderr — `[dnssd_shim] dnssd shim 1.0.0 (embedded mDNS)`, or
+itself on stderr — `[dnssd_shim] dnssd shim 1.1.0 (embedded mDNS)`, or
 `(Apple Bonjour proxy)` when it is forwarding — which also tells you which of the
 two paths is live. Deliberately not at DLL load: a host normally redirects its
 stdio after startup, so a line printed from `DllMain` goes nowhere (measured on

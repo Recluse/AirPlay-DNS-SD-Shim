@@ -35,7 +35,7 @@
 /* Bump on every published build, and tag the commit to match. Everything before
  * 1.0.0 was unversioned — which is exactly why a debug build reached users
  * unnoticed. Logged at load and greppable in the binary (see DllMain). */
-#define DNSSD_SHIM_VERSION "1.0.0"
+#define DNSSD_SHIM_VERSION "1.1.0"
 
 #define DNSSD_EXPORT __declspec(dllexport)
 #define DNSSD_API    __stdcall   /* no-op on x64; expected by UxPlay's typedef */
@@ -249,6 +249,7 @@ typedef struct {
 struct _DNSServiceRef_t {
     HANDLE thread;
     volatile LONG stop;
+    int sock;                      /* opened before we report success — see open_mdns_socket */
 
     char service_name[64];         /* e.g. "12AB34CD56EF@Windows-PC"  */
     char service_type[64];         /* e.g. "_raop._tcp.local."         */
@@ -306,9 +307,17 @@ static int ipv4_for_ifindex(uint32_t ifindex, struct sockaddr_in *out) {
     int found = 0;
     for (IP_ADAPTER_ADDRESSES *a = aa; a && !found; a = a->Next) {
         if (a->IfIndex != (DWORD)ifindex) continue;
+        /* Having an address is not the same as being able to use it: a static
+         * IPv4 survives the cable being pulled. Same check pick_local_ipv4()
+         * has always made — it just never applied to the pinned path. */
+        if (a->OperStatus != IfOperStatusUp) continue;
         for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
             if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
             struct sockaddr_in *si = (struct sockaddr_in *)u->Address.lpSockaddr;
+            /* Windows enumerates addresses that are still probing (Tentative) or
+             * lost the probe (Duplicate); binding either fails or hijacks a
+             * neighbour's address. Only Preferred is ours to use. */
+            if (u->DadState != IpDadStatePreferred) continue;
             if (((uint8_t *)&si->sin_addr)[0] == 127) continue;   /* nothing to advertise */
             /* 0.0.0.0 appears mid-DHCP-renew; advertising it would publish an A
              * record nobody can reach, and binding it is INADDR_ANY — i.e. the
@@ -628,9 +637,13 @@ static int probe_cb(int sock, const struct sockaddr *from, size_t addrlen,
     return 0;
 }
 
-/* Service responder thread: one INADDR_ANY UDP socket on 5353. */
-static DWORD WINAPI service_thread(LPVOID arg) {
-    DNSServiceRef sd = (DNSServiceRef)arg;
+/* Open the responder's socket. Runs on the CALLER's thread, before the
+ * registration reports success: UxPlay passes callBack=NULL, so a failure
+ * discovered later on the worker thread has nowhere to go — it would leave a
+ * registration that returned kDNSServiceErr_NoError and never announces
+ * anything. Returns -1 on failure; the caller refuses the registration. */
+static int open_mdns_socket(DNSServiceRef sd) {
+    int pinned = (sd->ipv4_addr.sin_family == AF_INET);
 
     /* Bind to the chosen LAN IP (not INADDR_ANY): mjansson then sets
      * IP_MULTICAST_IF to that interface, so OUTGOING multicast goes out via the
@@ -638,21 +651,40 @@ static DWORD WINAPI service_thread(LPVOID arg) {
     struct sockaddr_in bind_addr = {0};
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_port = htons(MDNS_PORT);
-    if (sd->ipv4_addr.sin_family == AF_INET)
-        bind_addr.sin_addr = sd->ipv4_addr.sin_addr;
-    else
-        bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_addr.s_addr = pinned ? sd->ipv4_addr.sin_addr.s_addr : INADDR_ANY;
+
+    uint8_t *b = (uint8_t *)&bind_addr.sin_addr;
+    char ip[16];
+    snprintf(ip, sizeof(ip), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+
     int sock = mdns_socket_open_ipv4(&bind_addr);
     if (sock < 0) {
-        LOG("failed to open mDNS socket: WSA=%d", WSAGetLastError());
-        return 1;
+        LOG("failed to open mDNS socket on %s: WSA=%d", ip, WSAGetLastError());
+        return -1;
     }
-    {
-        uint8_t *b = (uint8_t *)&bind_addr.sin_addr;
-        LOG("listening on %u.%u.%u.%u:5353 for service %s (instance %s, port %u)",
-            b[0], b[1], b[2], b[3],
-            sd->service_type, sd->service_instance, (unsigned)sd->port);
+
+    /* mdns.h sets IP_MULTICAST_IF and throws the result away, and on Windows it
+     * is that option — not the bind — that picks the outgoing interface. Set it
+     * again ourselves so a failure is visible and refusable: a bound socket is
+     * no proof the announcement is scoped where the caller asked. (mdns.h is
+     * vendored upstream, so the check lives here, not in it.) */
+    if (pinned && setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF,
+                             (const char *)&sd->ipv4_addr.sin_addr,
+                             sizeof(sd->ipv4_addr.sin_addr)) != 0) {
+        LOG("cannot scope outgoing mDNS to %s: WSA=%d", ip, WSAGetLastError());
+        mdns_socket_close(sock);
+        return -1;
     }
+
+    LOG("listening on %s:5353 for service %s (instance %s, port %u)",
+        ip, sd->service_type, sd->service_instance, (unsigned)sd->port);
+    return sock;
+}
+
+/* Service responder thread: drives the socket open_mdns_socket() handed us. */
+static DWORD WINAPI service_thread(LPVOID arg) {
+    DNSServiceRef sd = (DNSServiceRef)arg;
+    int sock = sd->sock;
 
     /* Probe for name conflicts before announcing. If another device on the LAN
      * already advertises our instance name, append " (2)", " (3)" … (like
@@ -818,9 +850,13 @@ DNSServiceRegister(DNSServiceRef *sdRef, DNSServiceFlags flags, uint32_t interfa
         pick_local_ipv4(&sd->ipv4_addr);
     }
 
+    /* Before anything else is allocated, so this failure path is just free(sd). */
+    sd->sock = open_mdns_socket(sd);
+    if (sd->sock < 0) { free(sd); return KDNSSERVICEERR_UNKNOWN; }
+
     if (txtLen && txtRecord) {
         sd->txt_blob = (uint8_t *)malloc(txtLen);
-        if (!sd->txt_blob) { free(sd); return KDNSSERVICEERR_NOMEMORY; }
+        if (!sd->txt_blob) { mdns_socket_close(sd->sock); free(sd); return KDNSSERVICEERR_NOMEMORY; }
         memcpy(sd->txt_blob, txtRecord, txtLen);
         sd->txt_len = txtLen;
         parse_txt_blob(sd);
@@ -828,6 +864,7 @@ DNSServiceRegister(DNSServiceRef *sdRef, DNSServiceFlags flags, uint32_t interfa
 
     sd->thread = CreateThread(NULL, 0, service_thread, sd, 0, NULL);
     if (!sd->thread) {
+        mdns_socket_close(sd->sock);   /* nobody left to close it */
         free(sd->txt_blob); free(sd->txt_entries); free(sd);
         return KDNSSERVICEERR_UNKNOWN;
     }
