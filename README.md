@@ -53,9 +53,12 @@ Single translation unit + the vendored `mdns.h` header — no external deps.
 
 ## Which build is this?
 
-The version is compiled in. A loaded shim announces itself on stderr —
-`[dnssd_shim] dnssd shim 1.0.0 loaded` — which lands in the host's log, and the
-same string is in the file:
+The version is compiled in. On its **first registration** the shim announces
+itself on stderr — `[dnssd_shim] dnssd shim 1.0.0 (embedded mDNS)`, or
+`(Apple Bonjour proxy)` when it is forwarding — which also tells you which of the
+two paths is live. Deliberately not at DLL load: a host normally redirects its
+stdio after startup, so a line printed from `DllMain` goes nowhere (measured on
+Windows). The same string is in the file regardless:
 
 ```bash
 strings dnssd.dll | grep "dnssd shim"

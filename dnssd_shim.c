@@ -754,6 +754,20 @@ DNSServiceRegister(DNSServiceRef *sdRef, DNSServiceFlags flags, uint32_t interfa
                    const char *host, uint16_t port_net,
                    uint16_t txtLen, const void *txtRecord,
                    DNSServiceRegisterReply callBack, void *context) {
+    /* Announce the version on the FIRST registration, not at load time.
+     *
+     * DllMain runs while the host is still starting, before it redirects its own
+     * stdio to a log file, so a line printed there goes to a stderr nobody is
+     * capturing yet and is simply lost — measured on Windows, not assumed. By the
+     * first DNSServiceRegister the redirect is in place, and this is also the
+     * moment the line is most useful: right next to the registration a bug report
+     * is about. Once per process; `strings dnssd.dll` still works regardless. */
+    static LONG announced = 0;
+    if (InterlockedCompareExchange(&announced, 1, 0) == 0) {
+        DNSSD_SHIM_LOG("dnssd shim " DNSSD_SHIM_VERSION " (%s mDNS)",
+                       p_DNSServiceRegister ? "Apple Bonjour proxy" : "embedded");
+    }
+
     /* Bonjour proxy: if Apple Bonjour Service is alive on this host, forward
      * directly to its dnssd.dll. UxPlay never knows the difference. */
     if (p_DNSServiceRegister) {
@@ -851,14 +865,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
-        /* Announce the version FIRST, before anything can fail. This shim used to
-         * carry no version at all, and the consequence was concrete: a build that
-         * had been shipped to users could only be identified by diffing sources
-         * and running `strings` on the binary, and it turned out to be a debug
-         * variant nobody meant to release. One line in the host's log now answers
-         * "which shim is actually running", and the same literal is findable in
-         * the file with `strings dnssd.dll | grep "dnssd shim"`. */
-        DNSSD_SHIM_LOG("dnssd shim " DNSSD_SHIM_VERSION " loaded");
+        /* No version line here — see DNSServiceRegister. Anything printed at load
+         * time goes to a stderr the host has not redirected yet and is lost. */
         try_load_apple_bonjour();
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_apple_dll) {
