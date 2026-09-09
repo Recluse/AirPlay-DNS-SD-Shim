@@ -22,6 +22,27 @@ The 7 symbols UxPlay loads:
 `TXTRecordSetValue`, `TXTRecordGetLength`, `TXTRecordGetBytesPtr`,
 `TXTRecordDeallocate`.
 
+## Choosing the adapter (`interfaceIndex`)
+
+`DNSServiceRegister`'s `interfaceIndex` is honoured: pass the Windows `IfIndex`
+of an adapter and the embedded responder binds its mDNS socket to *that*
+adapter's IPv4 and advertises that address — including a `169.254.x.x`
+link-local one, which is the direct-cable case link-local mDNS exists for. Pass
+`0` (or `kDNSServiceInterfaceIndexAny`) and it picks an address itself, as
+before, preferring real Ethernet/Wi-Fi over VMware/VirtualBox/WireGuard/Hyper-V
+adapters and skipping link-local. A **non-zero** index with no usable IPv4 —
+adapter unplugged, gone, or IPv6-only — is refused with `-65540`
+(`kDNSServiceErr_BadParam`; the shim's own macro for it is misnamed
+`KDNSSERVICEERR_INVALID`) and a log line, rather than silently falling back to
+the guess: a caller that named an adapter has pinned its sockets to it, and
+advertising a different one announces the service where it isn't listening. In
+Bonjour-proxy mode the index is passed straight to Apple's `dnssd.dll`.
+
+Note the index is a lossy identifier: an adapter may carry several IPv4
+addresses and the first is used. dns_sd gives the caller no way to name an
+address, so on a multi-address adapter the advertised A record can be a sibling
+of the address the caller's sockets bound to.
+
 ## Build
 
 From an MSYS2 **UCRT64** (or any MinGW-w64) shell:

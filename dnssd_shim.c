@@ -268,26 +268,73 @@ static void ensure_wsa(void) {
     g_wsa_initialized = 1;
 }
 
-/* Pick the most useful IPv4 unicast address: prefer adapters that aren't
- * VMware/VirtualBox/WireGuard/Hyper-V/tunnels. Returns 1 on success. */
-static int pick_local_ipv4(struct sockaddr_in *out) {
-    IP_ADAPTER_ADDRESSES *aa = NULL;
+/* GetAdaptersAddresses plus the grow-the-buffer dance. Caller frees.
+ * Returns NULL on any failure rather than a half-filled buffer — the previous
+ * inline version walked the list even after its retries ran out. */
+static IP_ADAPTER_ADDRESSES *alloc_adapters(void) {
     ULONG sz = 16 * 1024;
-    int found = 0;
-    struct sockaddr_in best = {0};
-    int best_score = -1;
-
     for (int retry = 0; retry < 4; ++retry) {
-        free(aa);
-        aa = (IP_ADAPTER_ADDRESSES *)malloc(sz);
-        if (!aa) return 0;
+        IP_ADAPTER_ADDRESSES *aa = (IP_ADAPTER_ADDRESSES *)malloc(sz);
+        if (!aa) return NULL;
         DWORD r = GetAdaptersAddresses(AF_INET,
             GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER,
             NULL, aa, &sz);
-        if (r == NO_ERROR) break;
-        if (r != ERROR_BUFFER_OVERFLOW) { free(aa); return 0; }
-        sz *= 2;
+        if (r == NO_ERROR) return aa;
+        free(aa);
+        if (r != ERROR_BUFFER_OVERFLOW) return NULL;
+        sz *= 2;                    /* sz now holds the size the API asked for */
     }
+    return NULL;
+}
+
+/* IPv4 of the adapter the caller named by mDNS interface index. Returns 1 on
+ * success.
+ *
+ * Unlike pick_local_ipv4() this accepts 169.254/16: an explicitly chosen
+ * adapter with only a link-local address is the direct-cable case link-local
+ * mDNS exists for, and the receiver's adapter picker offers exactly those. The
+ * skip in the guessing path stays — it is a heuristic for when nobody chose. */
+static int ipv4_for_ifindex(uint32_t ifindex, struct sockaddr_in *out) {
+    IP_ADAPTER_ADDRESSES *aa = alloc_adapters();
+    if (!aa) return 0;
+
+    int found = 0;
+    for (IP_ADAPTER_ADDRESSES *a = aa; a && !found; a = a->Next) {
+        if (a->IfIndex != (DWORD)ifindex) continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            struct sockaddr_in *si = (struct sockaddr_in *)u->Address.lpSockaddr;
+            if (((uint8_t *)&si->sin_addr)[0] == 127) continue;   /* nothing to advertise */
+            /* 0.0.0.0 appears mid-DHCP-renew; advertising it would publish an A
+             * record nobody can reach, and binding it is INADDR_ANY — i.e. the
+             * whole point of the pin, silently undone. Treat it as absent. */
+            if (si->sin_addr.s_addr == 0) continue;
+            /* NOTE: the interface index is a LOSSY identifier — one adapter can
+             * carry several IPv4 addresses, and we take the first. The caller
+             * pinned a specific ADDRESS, which the dns_sd API gives us no way to
+             * receive, so on a multi-address adapter we may advertise a sibling
+             * of the address the sockets bound to. The receiver's own picker only
+             * ever offers an adapter's first IPv4, so this can currently only be
+             * reached through a hand-edited config; if that stops being true, the
+             * fix is a private setter on this DLL, not more guessing here. */
+            *out = *si;
+            found = 1;
+            break;
+        }
+    }
+    free(aa);
+    return found;
+}
+
+/* Pick the most useful IPv4 unicast address: prefer adapters that aren't
+ * VMware/VirtualBox/WireGuard/Hyper-V/tunnels. Returns 1 on success. */
+static int pick_local_ipv4(struct sockaddr_in *out) {
+    IP_ADAPTER_ADDRESSES *aa = alloc_adapters();
+    if (!aa) return 0;
+
+    int found = 0;
+    struct sockaddr_in best = {0};
+    int best_score = -1;
 
     for (IP_ADAPTER_ADDRESSES *a = aa; a; a = a->Next) {
         if (a->OperStatus != IfOperStatusUp) continue;
@@ -709,7 +756,7 @@ DNSServiceRegister(DNSServiceRef *sdRef, DNSServiceFlags flags, uint32_t interfa
         return p_DNSServiceRegister(sdRef, flags, interfaceIndex, name, regtype, domain,
                                     host, port_net, txtLen, txtRecord, callBack, context);
     }
-    (void)flags; (void)interfaceIndex; (void)domain; (void)host;
+    (void)flags; (void)domain; (void)host;
     (void)callBack; (void)context;
     if (!sdRef || !name || !regtype) return KDNSSERVICEERR_INVALID;
     ensure_wsa();
@@ -729,7 +776,28 @@ DNSServiceRegister(DNSServiceRef *sdRef, DNSServiceFlags flags, uint32_t interfa
     compute_hostname(sd->hostname, sizeof(sd->hostname));
     sd->port = ntohs(port_net);
 
-    pick_local_ipv4(&sd->ipv4_addr);
+    /* The address we advertise is also the one the responder binds to, so the
+     * caller's interface choice decides both. Index 0 means "no choice" — keep
+     * guessing, so every existing caller behaves exactly as before. */
+    if (interfaceIndex) {
+        if (!ipv4_for_ifindex(interfaceIndex, &sd->ipv4_addr)) {
+            /* Refuse instead of falling back to the guess. A caller that names
+             * an index has pinned its sockets to that adapter; announcing some
+             * OTHER adapter's address is precisely the "advertised where it
+             * isn't listening" bug the index exists to prevent, and it would be
+             * invisible — UxPlay passes callBack=NULL, so there is no async
+             * error path, only this log. The caller has already checked the
+             * adapter was up moments earlier, so this is the cable-pulled race,
+             * not the common case. */
+            DNSSD_SHIM_LOG("interface index %u has no usable IPv4 (unplugged, "
+                           "gone, or IPv6-only) -- refusing to register %s",
+                           (unsigned)interfaceIndex, sd->service_type);
+            free(sd);
+            return KDNSSERVICEERR_INVALID;
+        }
+    } else {
+        pick_local_ipv4(&sd->ipv4_addr);
+    }
 
     if (txtLen && txtRecord) {
         sd->txt_blob = (uint8_t *)malloc(txtLen);
