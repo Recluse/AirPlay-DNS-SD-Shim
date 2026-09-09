@@ -32,6 +32,11 @@
 
 #include "mdns.h"
 
+/* Bump on every published build, and tag the commit to match. Everything before
+ * 1.0.0 was unversioned — which is exactly why a debug build reached users
+ * unnoticed. Logged at load and greppable in the binary (see DllMain). */
+#define DNSSD_SHIM_VERSION "1.0.0"
+
 #define DNSSD_EXPORT __declspec(dllexport)
 #define DNSSD_API    __stdcall   /* no-op on x64; expected by UxPlay's typedef */
 
@@ -846,6 +851,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+        /* Announce the version FIRST, before anything can fail. This shim used to
+         * carry no version at all, and the consequence was concrete: a build that
+         * had been shipped to users could only be identified by diffing sources
+         * and running `strings` on the binary, and it turned out to be a debug
+         * variant nobody meant to release. One line in the host's log now answers
+         * "which shim is actually running", and the same literal is findable in
+         * the file with `strings dnssd.dll | grep "dnssd shim"`. */
+        DNSSD_SHIM_LOG("dnssd shim " DNSSD_SHIM_VERSION " loaded");
         try_load_apple_bonjour();
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_apple_dll) {

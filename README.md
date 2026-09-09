@@ -51,6 +51,22 @@ gcc -O2 -Wall -shared -o dnssd.dll dnssd_shim.c -lws2_32 -liphlpapi
 ```
 Single translation unit + the vendored `mdns.h` header — no external deps.
 
+## Which build is this?
+
+The version is compiled in. A loaded shim announces itself on stderr —
+`[dnssd_shim] dnssd shim 1.0.0 loaded` — which lands in the host's log, and the
+same string is in the file:
+
+```bash
+strings dnssd.dll | grep "dnssd shim"
+```
+
+Bump `DNSSD_SHIM_VERSION` in `dnssd_shim.c` for every published build and tag the
+commit to match. Builds before 1.0.0 carried no version at all, and the cost was
+real: a debug variant of this file — one that appended every mDNS registration to
+a hardcoded log path — was shipped to users, and identifying it after the fact
+took a source diff and `strings` on the binary.
+
 ## Install — the load-order gotcha (important)
 
 `C:\Windows\System32\dnssd.dll` (Apple Bonjour) is found by the Win32 DLL search
