@@ -22,6 +22,10 @@ The 7 symbols UxPlay loads:
 `TXTRecordSetValue`, `TXTRecordGetLength`, `TXTRecordGetBytesPtr`,
 `TXTRecordDeallocate`.
 
+Plus one extra that is **not** part of `dns_sd`: `PopyachsaShimVersion()` returns
+a static string naming this build and which of the two paths is live. See
+"Which build is this?" below.
+
 ## Choosing the adapter (`interfaceIndex`)
 
 `DNSServiceRegister`'s `interfaceIndex` is honoured: pass the Windows `IfIndex`
@@ -62,12 +66,33 @@ Single translation unit + the vendored `mdns.h` header — no external deps.
 
 ## Which build is this?
 
-The version is compiled in. On its **first registration** the shim announces
-itself on stderr — `[dnssd_shim] dnssd shim 1.1.0 (embedded mDNS)`, or
-`(Apple Bonjour proxy)` when it is forwarding — which also tells you which of the
-two paths is live. Deliberately not at DLL load: a host normally redirects its
-stdio after startup, so a line printed from `DllMain` goes nowhere (measured on
-Windows). The same string is in the file regardless:
+The version is compiled in, and there are three ways to read it back. Each also
+says which of the two paths is live.
+
+**1. From the host, at runtime — the one that works in an application log.**
+Call the extra export:
+
+```c
+typedef const char * (__stdcall *shim_version_t)(void);
+shim_version_t v = (shim_version_t) GetProcAddress(dll, "PopyachsaShimVersion");
+/* "dnssd shim 1.1.0 (embedded mDNS)" | "… (Apple Bonjour proxy)" | NULL */
+```
+
+Apple's real `dnssd.dll` does not export this, so a `NULL` is itself the answer
+to "whose `dnssd.dll` got loaded?". The returned string is static — do not free
+it. Valid from load onward: the proxy-vs-embedded decision is made in `DllMain`.
+
+**2. From the shim's own stderr — only if the host captures it.** The shim
+prints `[dnssd_shim] dnssd shim 1.1.0 (embedded mDNS)` on its **first
+registration** (not at DLL load: a host normally redirects its stdio after
+startup, so a line printed from `DllMain` goes nowhere). That reaches you from a
+console build such as `uxplay.exe` run in a shell. It does **not** reach a GUI
+host: a windows-subsystem binary has no console and captures nothing on stderr,
+so the line is lost no matter when it is printed. Measured, not assumed — a
+registration demonstrably happened, the engine logged it, and no `[dnssd_shim]`
+line appeared anywhere. That measurement is why option 1 exists.
+
+**3. From the file on disk**, with no process running:
 
 ```bash
 strings dnssd.dll | grep "dnssd shim"

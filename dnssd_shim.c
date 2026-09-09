@@ -34,7 +34,8 @@
 
 /* Bump on every published build, and tag the commit to match. Everything before
  * 1.0.0 was unversioned — which is exactly why a debug build reached users
- * unnoticed. Logged at load and greppable in the binary (see DllMain). */
+ * unnoticed. Greppable in the binary, and reportable at runtime through
+ * PopyachsaShimVersion() below. */
 #define DNSSD_SHIM_VERSION "1.1.0"
 
 #define DNSSD_EXPORT __declspec(dllexport)
@@ -151,6 +152,28 @@ static void try_load_apple_bonjour(void) {
 
     g_apple_dll = m;
     DNSSD_SHIM_LOG("Bonjour proxy mode ACTIVE: forwarding to %s", path);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Identify this build to the host. NOT part of dns_sd — an extra export our own
+ * fork of UxPlay looks up with GetProcAddress and logs through the ENGINE's
+ * logger, which is the only channel that reaches an application log.
+ *
+ * The shim's own DNSSD_SHIM_LOG writes to stderr, and a GUI host (windows
+ * subsystem, no console) captures nothing there — measured on Windows: a
+ * registration demonstrably happened, the engine logged it, and not one
+ * `[dnssd_shim]` line appeared. Moving the announcement out of DllMain fixed
+ * the timing but not the channel; this export is the channel.
+ *
+ * Apple's real dnssd.dll does not export this, so the lookup simply fails and
+ * the caller logs nothing — which is itself the answer to "whose dnssd.dll got
+ * loaded?". The mode is settled in DllMain, so this is valid from load onward.
+ * Returns a static string; the caller must not free it. */
+DNSSD_EXPORT const char * DNSSD_API
+PopyachsaShimVersion(void) {
+    return p_DNSServiceRegister
+        ? "dnssd shim " DNSSD_SHIM_VERSION " (Apple Bonjour proxy)"
+        : "dnssd shim " DNSSD_SHIM_VERSION " (embedded mDNS)";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -786,14 +809,11 @@ DNSServiceRegister(DNSServiceRef *sdRef, DNSServiceFlags flags, uint32_t interfa
                    const char *host, uint16_t port_net,
                    uint16_t txtLen, const void *txtRecord,
                    DNSServiceRegisterReply callBack, void *context) {
-    /* Announce the version on the FIRST registration, not at load time.
-     *
-     * DllMain runs while the host is still starting, before it redirects its own
-     * stdio to a log file, so a line printed there goes to a stderr nobody is
-     * capturing yet and is simply lost — measured on Windows, not assumed. By the
-     * first DNSServiceRegister the redirect is in place, and this is also the
-     * moment the line is most useful: right next to the registration a bug report
-     * is about. Once per process; `strings dnssd.dll` still works regardless. */
+    /* Announce the version on the FIRST registration rather than at load time —
+     * useful when the host DOES capture our stderr (a console build, or uxplay.exe
+     * run from a shell). A GUI host does not: see PopyachsaShimVersion(), which is
+     * how the line reaches an app log. Once per process; `strings dnssd.dll` works
+     * regardless of either. */
     static LONG announced = 0;
     if (InterlockedCompareExchange(&announced, 1, 0) == 0) {
         DNSSD_SHIM_LOG("dnssd shim " DNSSD_SHIM_VERSION " (%s mDNS)",
