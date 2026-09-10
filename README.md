@@ -75,7 +75,7 @@ Call the extra export:
 ```c
 typedef const char * (__stdcall *shim_version_t)(void);
 shim_version_t v = (shim_version_t) GetProcAddress(dll, "PopyachsaShimVersion");
-/* "dnssd shim 1.1.0 (embedded mDNS)" | "… (Apple Bonjour proxy)" | NULL */
+/* "dnssd shim 1.1.1 (embedded mDNS)" | "… (Apple Bonjour proxy)" | NULL */
 ```
 
 Apple's real `dnssd.dll` does not export this, so a `NULL` is itself the answer
@@ -83,7 +83,7 @@ to "whose `dnssd.dll` got loaded?". The returned string is static — do not fre
 it. Valid from load onward: the proxy-vs-embedded decision is made in `DllMain`.
 
 **2. From the shim's own stderr — only if the host captures it.** The shim
-prints `[dnssd_shim] dnssd shim 1.1.0 (embedded mDNS)` on its **first
+prints `[dnssd_shim] dnssd shim 1.1.1 (embedded mDNS)` on its **first
 registration** (not at DLL load: a host normally redirects its stdio after
 startup, so a line printed from `DllMain` goes nowhere). That reaches you from a
 console build such as `uxplay.exe` run in a shell. It does **not** reach a GUI

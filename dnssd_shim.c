@@ -36,7 +36,7 @@
  * 1.0.0 was unversioned — which is exactly why a debug build reached users
  * unnoticed. Greppable in the binary, and reportable at runtime through
  * PopyachsaShimVersion() below. */
-#define DNSSD_SHIM_VERSION "1.1.0"
+#define DNSSD_SHIM_VERSION "1.1.1"
 
 #define DNSSD_EXPORT __declspec(dllexport)
 #define DNSSD_API    __stdcall   /* no-op on x64; expected by UxPlay's typedef */
@@ -273,6 +273,11 @@ struct _DNSServiceRef_t {
     HANDLE thread;
     volatile LONG stop;
     int sock;                      /* opened before we report success — see open_mdns_socket */
+    /* Who frees this. Both the responder thread (on exit) and
+     * DNSServiceRefDeallocate (after its wait) InterlockedExchange a 1 in here;
+     * whichever one reads back a 1 is the second to arrive and does the free.
+     * Exactly one of them ever does, with no window in between. */
+    volatile LONG released;
 
     char service_name[64];         /* e.g. "12AB34CD56EF@Windows-PC"  */
     char service_type[64];         /* e.g. "_raop._tcp.local."         */
@@ -660,6 +665,14 @@ static int probe_cb(int sock, const struct sockaddr *from, size_t addrlen,
     return 0;
 }
 
+/* Release an sdRef's memory. Called by whichever of the responder thread and
+ * DNSServiceRefDeallocate arrives second — never by both. */
+static void sdref_free(DNSServiceRef sd) {
+    free(sd->txt_entries);
+    free(sd->txt_blob);
+    free(sd);
+}
+
 /* Open the responder's socket. Runs on the CALLER's thread, before the
  * registration reports success: UxPlay passes callBack=NULL, so a failure
  * discovered later on the worker thread has nowhere to go — it would leave a
@@ -786,6 +799,9 @@ static DWORD WINAPI service_thread(LPVOID arg) {
     mdns_goodbye_multicast(sock, sendbuf, sizeof(sendbuf), rec_ptr,
                            NULL, 0, additionals, n_add);
     mdns_socket_close(sock);
+    /* If DNSServiceRefDeallocate already gave up waiting for us, it left the
+     * struct alive on purpose and we own it now. */
+    if (InterlockedExchange(&sd->released, 1) == 1) sdref_free(sd);
     return 0;
 }
 
@@ -908,13 +924,22 @@ DNSServiceRefDeallocate(DNSServiceRef sdRef) {
         return;
     }
     InterlockedExchange(&sdRef->stop, 1);
-    if (sdRef->thread) {
-        WaitForSingleObject(sdRef->thread, 3000);
-        CloseHandle(sdRef->thread);
+    /* Read the handle out BEFORE the handoff below: once the thread owns the
+     * struct it may free it, and sdRef->thread would be a read of freed memory. */
+    HANDLE th = sdRef->thread;
+    if (th) {
+        /* The wait can time out — the thread blocks up to 200 ms in select() and
+         * then sends goodbye packets. It used to CloseHandle and free anyway,
+         * which is a use-after-free of everything the still-running thread is
+         * reading, plus a leaked socket it would have closed itself. */
+        WaitForSingleObject(th, 3000);
+        CloseHandle(th);
     }
-    free(sdRef->txt_entries);
-    free(sdRef->txt_blob);
-    free(sdRef);
+    /* Hand off rather than guess: if the thread has already exited it stored a 1
+     * and we free; if it is still running we read 0, leave the struct alive, and
+     * IT frees on exit. A stuck thread therefore leaks one small struct instead
+     * of pulling the ground out from under itself. */
+    if (InterlockedExchange(&sdRef->released, 1) == 1) sdref_free(sdRef);
 }
 
 /* DllMain — probe for working Apple Bonjour at load time; fall back to embedded. */
